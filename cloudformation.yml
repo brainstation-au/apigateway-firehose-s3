@@ -1,0 +1,165 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Batch delivery of Streaming data to S3
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  DeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+  ApiLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt Bucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 120
+          SizeInMBs: 10
+        ErrorOutputPrefix: error-123/
+        Prefix: data-123/
+        RoleARN: !GetAtt DeliveryRole.Arn
+        ProcessingConfiguration:
+          Enabled: True
+          Processors:
+            - Parameters:
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '3'
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt FirehoseLambda.Arn
+                - ParameterName: NumberOfRetries
+                  ParameterValue: '1'
+              Type: Lambda
+
+  FirehoseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  FirehoseLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            return {
+              records: event.records.map(record => ({
+                recordId: record.recordId,
+                result: 'Ok',
+                data: (Buffer.from(`${(Buffer.from(record.data, 'base64')).toString('ascii')}\n`)).toString('base64'),
+              }))
+            };
+          };
+      Description: Add a new line at the end of each record
+      Handler: index.handler
+      Role: !GetAtt FirehoseLambdaRole.Arn
+      Runtime: nodejs16.x
+      Timeout: 60
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: test-api
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !GetAtt RestApi.RootResourceId
+      RestApiId: !Ref RestApi
+      AuthorizationType: NONE
+      Integration:
+        Credentials: !GetAtt ApiRole.Arn
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - ResponseTemplates:
+              'application/json': '{"status": "OK"}'
+            StatusCode: '200'
+        RequestTemplates:
+          'application/json': !Sub |
+            #set( $body = $input.body )
+            #set( $b64 = $util.base64Encode($body) )
+            {
+              "DeliveryStreamName": "${DeliveryStream}",
+              "Record": { "Data": "$b64" }
+            }
+        Type: AWS
+        Uri: arn:aws:apigateway:ap-southeast-2:firehose:action/PutRecord
+      MethodResponses:
+        - StatusCode: '200'
+
+  ApiAccount:
+    Type: AWS::ApiGateway::Account
+    DependsOn:
+      - RestApi
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiLogsRole.Arn
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: !Ref StageName
+
+Outputs:
+  InvokeURL:
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
